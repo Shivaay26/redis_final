@@ -19,9 +19,6 @@
 #include "hashtable.h"
 #include <netinet/tcp.h>  // Required for TCP_NODELAY
 
-
-
-
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
@@ -80,6 +77,47 @@ static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
     buf.erase(buf.begin(), buf.begin() + n);
 }
 
+// Global pool
+std::vector<Conn*> conn_pool;
+const size_t k_pool_size = 10000;
+
+void init_pool() {
+    conn_pool.reserve(k_pool_size);
+    for (size_t i = 0; i < k_pool_size; ++i) {
+        Conn *c = new Conn();
+        c->incoming.reserve(64 * 1024);
+        c->outgoing.reserve(64 * 1024);
+        conn_pool.push_back(c);
+    }
+}
+
+Conn* acquire_conn() {
+    if (conn_pool.empty()) {
+        Conn *c = new Conn();
+        c->incoming.reserve(64 * 1024);
+        c->outgoing.reserve(64 * 1024);
+        return c;
+    }
+    Conn *c = conn_pool.back();
+    conn_pool.pop_back();
+    // Reset state
+    c->fd = -1;
+    c->want_read = false;
+    c->want_write = false;
+    c->want_close = false;
+    c->incoming.clear();
+    c->outgoing.clear();
+    return c;
+}
+
+void release_conn(Conn *c) {
+    if (conn_pool.size() < k_pool_size) {
+        conn_pool.push_back(c);
+    } else {
+        delete c;
+    }
+}
+
 // update epoll events for a connection
 static void conn_update_epoll(int epoll_fd, Conn *conn) {
     struct epoll_event ev = {};
@@ -120,7 +158,7 @@ static Conn *handle_accept(int epoll_fd, int fd) {
     fd_set_nb(connfd);
 
     // create a `struct Conn`
-    Conn *conn = new Conn();
+    Conn *conn = acquire_conn();
     conn->fd = connfd;
     conn->incoming.reserve(64 * 1024);   // Pre-allocate 64KB
     conn->outgoing.reserve(64 * 1024);   // Pre-allocate 64KB
@@ -133,7 +171,7 @@ static Conn *handle_accept(int epoll_fd, int fd) {
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd, &ev) < 0) {
         msg_errno("epoll_ctl ADD error");
         close(connfd);
-        delete conn;
+        release_conn(conn);
         return NULL;
     }
     
@@ -368,7 +406,7 @@ static void handle_write(int epoll_fd, Conn *conn) {
 // application callback when the socket is readable
 static void handle_read(int epoll_fd, Conn *conn) {
     // read some data
-    uint8_t buf[64 * 1024];
+    uint8_t buf[256 * 1024];
     ssize_t rv = read(conn->fd, buf, sizeof(buf));
     if (rv < 0 && errno == EAGAIN) {
         return; // actually not ready
@@ -454,7 +492,7 @@ int main() {
     std::vector<Conn *> fd2conn;
     
     // events buffer for epoll_wait
-    const int k_max_events = 1024;
+    const int k_max_events = 10000;
     struct epoll_event events[k_max_events];
     
     // the event loop
@@ -506,7 +544,7 @@ int main() {
                 // close and cleanup
                 (void)close(conn->fd);
                 fd2conn[conn->fd] = NULL;
-                delete conn;
+                release_conn(conn);
             }
         }   // for each ready event
     }   // the event loop

@@ -64,7 +64,7 @@ To verify server efficiency, I built a custom C++ benchmarking tool (`swarm`) wi
 
 ### 1. Compile the Server
 ```bash
-g++ -O3 -march=native -flto -DNDEBUG -std=c++17 server.cpp -o server
+g++ -O3 -march=native -flto -DNDEBUG -std=c++17 server_epoll.cpp hashtable.cpp -o server
 ```
 
 ### 2. Start the Server
