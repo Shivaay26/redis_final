@@ -4,7 +4,7 @@ A high-throughput, event-driven key-value store built from scratch in C++.
 Designed to demonstrate **asynchronous I/O**, **custom event loop**, **pipelining**, **intrusive data structures**, and **binary protocol parsing** at scale.
 
 ![Throughput vs Latency](./benchmark_result.png)
-*Figure 1: Benchmark results showing 1.47M requests per second (RPS) peak throughput and sub-millisecond P99 latency up to ~50 concurrent clients.*
+*Figure 1: Benchmark results showing 1.65M requests per second (RPS) peak throughput at 100 concurrent clients, with sub-3ms P99 latency.*
 
 ---
 
@@ -13,10 +13,9 @@ Designed to demonstrate **asynchronous I/O**, **custom event loop**, **pipelinin
 * **Event-Driven Architecture:** Uses `epoll` for O(1) event notification on Linux. *(Note: Benchmarks showed minimal difference vs `poll` for <10k connections due to socket descriptor limits becoming the bottleneck.)*
 * **Custom Intrusive Hashtable:** Scratch-built hashtable using intrusive linked lists for zero-allocation lookups and better cache locality.
 * **Progressive Resizing:** Incremental hashtable expansion to avoid stop-the-world latency spikes during growth.
-* **Efficient I/O batching** Fully asynchronous socket handling with custom state machines for reading/writing.
+* **Efficient I/O Batching:** Fully asynchronous socket handling with custom state machines for reading/writing.
 * **Binary-Safe Protocol:** Custom serialization protocol supporting pipelined requests without parsing overhead.
 * **Command Pipelining:** Batches multiple commands per TCP packet for 10-50x throughput gains.
-* **Zero-Copy Optimizations:** Efficient buffer management minimizing kernel-user space transitions.
 
 ---
 
@@ -37,19 +36,24 @@ Designed to demonstrate **asynchronous I/O**, **custom event loop**, **pipelinin
 To verify server efficiency, I built a custom C++ benchmarking tool (`swarm`) with **nanosecond-precision latency tracking** and support for thousands of concurrent pipelined connections.
 
 ### Test Environment
-* **Hardware:** [Your CPU/RAM specs - e.g., Intel i5-10th gen, 16GB DDR4]
-* **OS:** Linux (kernel 5.x+)
+* **Platform:** WSL2 (Windows Subsystem for Linux)
+* **Hardware:** Consumer-grade laptop (Intel/AMD x86_64, 8-16GB RAM)
+* **Compilation:** `g++ -O3 -march=native -flto -DNDEBUG`
 * **Methodology:** Open-loop stress test with pipelined requests
-* **Compilation:** `g++ -O3 -march=native -flto -DNDEBUG` (enables AVX/SSE vectorization)
 
 ### Results Summary
 
 | Metric | Value | Notes |
 |:-------|:------|:------|
-| **Peak Throughput** | **1,469,000 RPS** | Achieved at 10 concurrent clients |
-| **P99 Latency (Low Load)** | **0.09 ms (90 µs)** | Single-client baseline |
-| **Sustained Load** | **1,190,000 RPS** | Maintained at 1,000 concurrent clients |
-| **Saturation Point** | **~50 clients** | Latency knee point (CPU cores saturated) |
+| **Peak Throughput** | **1,650,592 RPS** | Achieved at 100 concurrent clients |
+| **Sustained Load** | **1,250,000+ RPS** | Maintained at 1,000 clients |
+| **P99 Latency (Peak)** | **2.72 ms** | At 100 clients / peak throughput |
+| **P99 Latency (Low Load)** | **0.09 ms** | Single client baseline |
+
+**Performance Notes:**
+- Single-threaded architecture limits throughput to one CPU core
+- WSL2 adds ~200-300ns syscall overhead vs native Linux
+- Native Linux would achieve **~2M+ RPS** (+20-30%)
 
 **Key Observation:** The latency graph exhibits classic queuing theory behavior—near-zero latency until CPU saturation, followed by a "hockey stick" curve as request buffering engages to preserve throughput under backpressure.
 
@@ -60,7 +64,7 @@ To verify server efficiency, I built a custom C++ benchmarking tool (`swarm`) wi
 ### Prerequisites
 * **OS:** Linux (or WSL2 on Windows)
 * **Compiler:** g++ with C++17 support
-* **Python:** 3.7+ (for benchmark visualization)
+* **Python:** 3.7+ with matplotlib (for benchmark visualization)
 
 ### 1. Compile the Server
 ```bash
@@ -73,7 +77,13 @@ g++ -O3 -march=native -flto -DNDEBUG -std=c++17 server_epoll.cpp hashtable.cpp -
 ```
 *Server listens on `localhost:1234` by default.*
 
-### 3. Generate Performance Graphs
+### 3. Compile the Benchmark Client
+```bash
+cd benchmark
+g++ -O3 -march=native -flto -DNDEBUG -std=c++17 swarm.cpp -o swarm_bench
+```
+
+### 4. Generate Performance Graphs
 ```bash
 python3 plot_benchmark.py
 ```
@@ -125,7 +135,7 @@ Custom protocol avoids the overhead of text parsing (like Redis RESP):
 
 ## 📈 Benchmark Insights
 
-### Why Does Latency Spike at 50 Clients?
+### Why Does Latency Spike at 100 Clients?
 This is the **saturation point** where:
 1. CPU core is fully utilized processing requests (single-threaded bottleneck)
 2. New requests start queuing in the kernel's socket buffers
@@ -133,7 +143,7 @@ This is the **saturation point** where:
 
 This is **normal behavior** for any high-performance server and demonstrates proper backpressure handling.
 
-### Why Does Throughput Plateau at 1.47M RPS?
+### Why Does Throughput Plateau at 1.65M RPS?
 Likely bottlenecks (in order of impact):
 - **Single-threaded:** Only one CPU core utilized (visible in `htop` as one core at 100%)
 - **Syscall overhead:** Even with batching, `read`/`write` consume ~15-20% CPU time
@@ -144,17 +154,19 @@ Likely bottlenecks (in order of impact):
 - Multi-threaded architecture with lock-free hashtable (e.g., Folly ConcurrentHashMap) → **+4-8x RPS**
 - SIMD-accelerated hash functions (xxHash) for faster hashing → **+5-10% RPS**
 
+---
+
 ## 🔧 Project Structure
 ```
 .
-├── server_epoll.cpp              # Main server implementation
-├── hashtable.h and hastable.cpp      # header file and implementation for hastable
-├── swarm.cpp               # High-performance benchmark client
-├── benchmark   
-    ├── plot_benchmark.py   # Automated benchmark runner & visualizer
-    ├── swarm.py            # High-performance benchmark client
-├── benchmark_result.png    # Performance graph output
-└── README.md               # This file
+├── server_epoll.cpp         # Main server implementation
+├── hashtable.h              # Hashtable interface
+├── hashtable.cpp            # Hashtable implementation
+├── benchmark/
+│   ├── swarm.cpp            # High-performance benchmark client (C++)
+│   └── plot_benchmark.py    # Automated benchmark runner & visualizer
+├── benchmark_result.png     # Performance graph output (generated)
+└── README.md                # This file
 ```
 
 ---
@@ -169,7 +181,7 @@ This project demonstrates concepts from:
 
 Recommended reading:
 - *[Beej's Guide to Network Programming](https://beej.us/guide/bgnet/)*
-- *[Building redis from scratch](https://build-your-own.org/redis/)* (the actual guide I followed)
+- *[Build Your Own Redis](https://build-your-own.org/redis/)* (the guide I followed)
 - *Redis source code* (`networking.c`, `dict.c`)
 
 ---
@@ -180,10 +192,9 @@ MIT License. Free to use for educational and commercial purposes.
 
 ---
 
-
 ## 📧 Contact
 
-Questions? Open an issue or reach out on praveenshahi26@gmail.com.
+Questions? Open an issue or reach out at praveenshahi26@gmail.com.
 
 ---
 

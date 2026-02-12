@@ -5,7 +5,7 @@ import os
 import signal
 
 # Configuration
-SERVER_CMD = "./server"
+SERVER_CMD = "../server"
 CLIENT_SRC = "swarm.cpp"
 CLIENT_EXE = "./swarm_bench"
 TOTAL_REQS = 1000000
