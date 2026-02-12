@@ -20,6 +20,8 @@
 #include <netinet/tcp.h>  // Required for TCP_NODELAY
 
 
+
+
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
@@ -120,6 +122,8 @@ static Conn *handle_accept(int epoll_fd, int fd) {
     // create a `struct Conn`
     Conn *conn = new Conn();
     conn->fd = connfd;
+    conn->incoming.reserve(64 * 1024);   // Pre-allocate 64KB
+    conn->outgoing.reserve(64 * 1024);   // Pre-allocate 64KB
     conn->want_read = true;
     
     // add to epoll
