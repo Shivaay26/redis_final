@@ -5,41 +5,50 @@ import os
 import signal
 
 # Configuration
-SERVER_CMD = "./server"     # Path to your server executable
-CLIENT_SRC = "swarm.cpp"    # Path to the C++ client source
+SERVER_CMD = "./server"
+CLIENT_SRC = "swarm.cpp"
 CLIENT_EXE = "./swarm_bench"
-TOTAL_REQS = 1000000        # Constant load: 1 Million requests
+TOTAL_REQS = 1000000
 
-# Define the concurrency levels to test
-concurrency_levels = [1, 10, 50, 100, 200, 500, 800, 1000,5000, 10000]
-results = []
+concurrency_levels = [1, 10, 50, 100, 200, 500, 800, 1000]
+results = []  # List of (rps, p99) tuples
 
 def compile_client():
     print("Compiling benchmark client...")
-    subprocess.run(["g++", "-O3", CLIENT_SRC, "-o", CLIENT_EXE], check=True)
+    subprocess.run([
+    "g++", 
+    CLIENT_SRC, 
+    "-o", CLIENT_EXE,
+    "-O3",                # Maximum general optimization
+    "-march=native",      # CRITICAL: Uses your CPU's specific instructions (AVX/AVX2)
+    "-flto",              # Link Time Optimization (inlines across boundaries)
+    "-DNDEBUG",           # CRITICAL: Removes all assert() checks
+    "-fno-exceptions",    # Removes exception handling overhead (if not using try/catch)
+    "-fno-rtti",          # Removes runtime type info overhead
+    "-std=c++17"          # Use modern C++ optimizations
+], check=True)
 
 def run_test(clients):
     print(f"Testing {clients} clients...", end="", flush=True)
     
-    # 1. Start Server
     server = subprocess.Popen([SERVER_CMD], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.5) # Give it time to start
+    time.sleep(1)  # Increased startup time
 
     try:
-        # 2. Run Benchmark
-        # cmd: ./swarm_bench <clients> <total_requests>
-        output = subprocess.check_output([CLIENT_EXE, str(clients), str(TOTAL_REQS)])
-        rps = float(output.strip())
-        print(f" RPS: {rps:.0f}")
-        return rps
-    except subprocess.CalledProcessError as e:
-        print(" Failed!")
-        return 0
+        output = subprocess.check_output([CLIENT_EXE, str(clients), str(TOTAL_REQS)], 
+                                          timeout=60)  # Add timeout
+        rps_str, p99_str = output.decode().strip().split(',')
+        rps = float(rps_str)
+        p99 = float(p99_str)
+        print(f" RPS: {rps:.0f}, P99: {p99:.2f}ms")
+        return (rps, p99)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
+        print(f" Failed! ({e})")
+        return (0, 0)
     finally:
-        # 3. Kill Server
         server.terminate()
         server.wait()
-        time.sleep(0.5) # Wait for socket cleanup (TIME_WAIT)
+        time.sleep(1)  # Increased cleanup time
 
 if __name__ == "__main__":
     if not os.path.exists(SERVER_CMD):
@@ -51,23 +60,41 @@ if __name__ == "__main__":
     print(f"\n--- Starting Benchmark (Total Load: {TOTAL_REQS} reqs) ---\n")
     
     for c in concurrency_levels:
-        rps = run_test(c)
-        results.append(rps)
+        result = run_test(c)
+        results.append(result)
 
-    # Plotting
-    plt.figure(figsize=(10, 6))
-    plt.plot(concurrency_levels, results, marker='o', linestyle='-', color='b')
-    plt.title(f'Throughput vs Concurrency (Total Requests: {TOTAL_REQS})')
-    plt.xlabel('Number of Concurrent Clients')
-    plt.ylabel('Requests Per Second (RPS)')
-    plt.grid(True)
-    plt.xscale('log') # Log scale helps visualize 1 vs 1000 better
+    # Extract metrics
+    rps_values = [r[0] for r in results]
+    p99_values = [r[1] for r in results]
+
+    # Plot RPS
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Annotate points
-    for x, y in zip(concurrency_levels, results):
-        plt.annotate(f"{y/1000:.0f}k", (x, y), textcoords="offset points", xytext=(0,10), ha='center')
+    ax1.plot(concurrency_levels, rps_values, marker='o', linestyle='-', color='b')
+    ax1.set_title(f'Throughput vs Concurrency (Total: {TOTAL_REQS} reqs)')
+    ax1.set_xlabel('Concurrent Clients')
+    ax1.set_ylabel('Requests Per Second (RPS)')
+    ax1.grid(True)
+    ax1.set_xscale('log')
+    for x, y in zip(concurrency_levels, rps_values):
+        if y > 0:
+            ax1.annotate(f"{y/1000:.0f}k", (x, y), textcoords="offset points", 
+                        xytext=(0,10), ha='center', fontsize=8)
 
+    # Plot P99 Latency
+    ax2.plot(concurrency_levels, p99_values, marker='s', linestyle='-', color='r')
+    ax2.set_title('P99 Latency vs Concurrency')
+    ax2.set_xlabel('Concurrent Clients')
+    ax2.set_ylabel('P99 Latency (ms)')
+    ax2.grid(True)
+    ax2.set_xscale('log')
+    for x, y in zip(concurrency_levels, p99_values):
+        if y > 0:
+            ax2.annotate(f"{y:.1f}", (x, y), textcoords="offset points", 
+                        xytext=(0,10), ha='center', fontsize=8)
+
+    plt.tight_layout()
     output_file = "benchmark_result.png"
-    plt.savefig(output_file)
+    plt.savefig(output_file, dpi=150)
     print(f"\nGraph saved to {output_file}")
     plt.show()
