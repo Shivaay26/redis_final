@@ -4,18 +4,18 @@ A high-throughput, event-driven key-value store built from scratch in C++.
 Designed to demonstrate **asynchronous I/O**, **custom event loop**, **pipelining**, **intrusive data structures**, and **binary protocol parsing** at scale.
 
 ![Throughput vs Latency](./benchmark_result.png)
-*Figure 1: Benchmark results showing 1.65M requests per second (RPS) peak throughput at 100 concurrent clients, with sub-3ms P99 latency.*
+*Figure 1: Benchmark results showing 1.65M requests per second (RPS) peak throughput at 100 concurrent clients on WSL2, with sub-2ms P99 latency.*
 
 ---
 
 ## 🚀 Key Features
 
-* **Event-Driven Architecture:** Uses `epoll` for O(1) event notification on Linux. *(Note: Benchmarks showed minimal difference vs `poll` for <10k connections due to socket descriptor limits becoming the bottleneck.)*
-* **Custom Intrusive Hashtable:** Scratch-built hashtable using intrusive linked lists for zero-allocation lookups and better cache locality.
-* **Progressive Resizing:** Incremental hashtable expansion to avoid stop-the-world latency spikes during growth.
-* **Efficient I/O Batching:** Fully asynchronous socket handling with custom state machines for reading/writing.
-* **Binary-Safe Protocol:** Custom serialization protocol supporting pipelined requests without parsing overhead.
-* **Command Pipelining:** Batches multiple commands per TCP packet for 10-50x throughput gains.
+* **Event-Driven Architecture:** Uses `epoll` for O(1) event notification on Linux
+* **Custom Intrusive Hashtable:** Scratch-built hashtable using intrusive linked lists for zero-allocation lookups and better cache locality
+* **Progressive Resizing:** Incremental hashtable expansion to avoid stop-the-world latency spikes during growth
+* **Efficient I/O Batching:** Fully asynchronous socket handling with custom state machines for reading/writing
+* **Binary-Safe Protocol:** Custom serialization protocol supporting pipelined requests without parsing overhead
+* **Command Pipelining:** Batches multiple commands per TCP packet for 10-50x throughput gains
 
 ---
 
@@ -35,27 +35,49 @@ Designed to demonstrate **asynchronous I/O**, **custom event loop**, **pipelinin
 
 To verify server efficiency, I built a custom C++ benchmarking tool (`swarm`) with **nanosecond-precision latency tracking** and support for thousands of concurrent pipelined connections.
 
+### Platform Comparison
+
+I tested on both WSL2 and native Linux (dual-boot, identical hardware) to measure platform differences:
+
+**Key Results:**
+- **Peak Throughput:** 1.65M requests/second (WSL2)
+- **Best-Case Latency:** 60-90 microseconds P99
+- **At Peak Load:** 1.9ms P99 @ 1.65M RPS
+
+| Platform | Peak RPS | P99 Latency | Performance Window |
+|:---------|:---------|:------------|:-------------------|
+| **WSL2** | **1,650,592** | **0.09ms – 1.9ms** | 1-100 concurrent clients |
+| **Linux (Fedora)** | **1,277,770** | **0.06ms – 2.7ms** | 1-100 concurrent clients |
+
+**Key Insight:** The server maintains **sub-2ms P99 latency** up to peak throughput (100 clients, 1.65M RPS). Beyond this point, CPU saturation causes latency to degrade as the system enters overload - reaching 7ms @ 500 clients and 41ms @ 1000 clients.
+
+### Why is WSL2 Faster for Localhost?
+
+This surprising result is due to **WSL2's optimized loopback implementation**:
+
+- **WSL2 localhost:** Uses an optimized inter-process communication path between Windows and Linux, potentially bypassing parts of the traditional TCP/IP stack
+- **Linux localhost:** Goes through the full TCP/IP network stack, even for `127.0.0.1`
+
+**Real-World Implications:**
+- ✅ For **development and testing** on localhost, WSL2 provides excellent performance
+- ⚠️ For **production benchmarks**, these numbers may not represent real network performance
+- 📊 For **realistic measurements**, testing over actual network interfaces is recommended
+
+**Key Insight:** Both platforms hit the same fundamental limit - **single-core CPU saturation**. The difference is in localhost overhead, not the server architecture itself.
+
+### Conservative Performance Estimate
+
+For production deployments over real networks, use the **Linux numbers as a baseline:**
+- **Peak Throughput:** 1.28M RPS
+- **P99 Latency:** 0.06ms – 2.7ms (1-100 clients)
+
+---
+
 ### Test Environment
-* **Platform:** WSL2 (Windows Subsystem for Linux)
+* **Platform:** WSL2 / Fedora Linux (dual boot)
 * **Hardware:** Consumer-grade laptop (Intel/AMD x86_64, 8-16GB RAM)
 * **Compilation:** `g++ -O3 -march=native -flto -DNDEBUG`
-* **Methodology:** Open-loop stress test with pipelined requests
-
-### Results Summary
-
-| Metric | Value | Notes |
-|:-------|:------|:------|
-| **Peak Throughput** | **1,650,592 RPS** | Achieved at 100 concurrent clients |
-| **Sustained Load** | **1,250,000+ RPS** | Maintained at 1,000 clients |
-| **P99 Latency (Peak)** | **2.72 ms** | At 100 clients / peak throughput |
-| **P99 Latency (Low Load)** | **0.09 ms** | Single client baseline |
-
-**Performance Notes:**
-- Single-threaded architecture limits throughput to one CPU core
-- WSL2 adds ~200-300ns syscall overhead vs native Linux
-- Native Linux would achieve **~2M+ RPS** (+20-30%)
-
-**Key Observation:** The latency graph exhibits classic queuing theory behavior—near-zero latency until CPU saturation, followed by a "hockey stick" curve as request buffering engages to preserve throughput under backpressure.
+* **Methodology:** Open-loop stress test with pipelined requests over TCP localhost
 
 ---
 
@@ -93,27 +115,43 @@ python3 plot_benchmark.py
 
 ## 🧠 Core Engineering Concepts
 
-### 1. Custom Intrusive Hashtable
-Standard `std::unordered_map` is too slow for high-performance servers due to:
-- **Allocation overhead:** Each insert triggers `malloc`
-- **Pointer chasing:** Poor CPU cache locality
+### 1. Custom Intrusive Hashtable (The "Secret Sauce")
+Standard containers like `std::unordered_map` hit a performance ceiling because they're designed for convenience, not raw speed.
 
-**Solution:**
-- **Intrusive design:** The `next` pointer is embedded directly in the node, eliminating heap allocations during traversal.
-- **Progressive resizing:** Instead of blocking to resize the entire table (O(n) freeze), the table migrates keys incrementally—moving a small batch per request cycle. This keeps P99 latency deterministic.
+**The Problem:**
+- Every insertion requires a `malloc` for the node
+- Every lookup requires pointer chasing
+- At 1M+ RPS, the memory allocator becomes the bottleneck
 
-### 2. Event Loop Architecture
-Traditional thread-per-client models waste resources:
-- Each thread consumes **1MB+ stack memory**
-- Context switching overhead kills performance beyond ~1000 threads
+**Our Solution - Intrusive Data Structure:**
+- **Embedded Pointers:** The `next` pointer is embedded *inside* the `Entry` struct itself
+- **Zero Allocation:** We can move nodes between lists (e.g., during resizing) without allocating or freeing memory
+- **Progressive Resizing:** Instead of freezing the server to resize a massive table (O(N) latency spike), we migrate a small batch of keys incrementally per request. This keeps latency deterministic (O(1))
 
-**This server uses:**
+### 2. The Event Loop (`epoll`)
+As we scaled past 10,000 connections, standard polling failed. We moved to an **Event-Driven Architecture**.
+
+**Why Event Loop?**
+- **Thread-per-Client:** Consumes ~1MB stack per client. Caps at ~10k clients due to RAM
+- **Event Loop:** Uses **one thread** for all clients. The Kernel (`epoll`) notifies us only when data is ready. This allows CPU usage to stay focused on *processing* data, not *waiting* for it
+
+**Implementation:**
 - **Single-threaded event loop:** One thread handles 10,000+ connections
 - **State machines:** Each connection is a state machine (`STATE_REQ` → `STATE_RES` → `STATE_END`)
 - **epoll multiplexing:** Kernel notifies the app only when sockets are ready, eliminating busy-polling CPU waste
 
-### 3. Pipelining & Buffer Management
-Network syscalls (`read`/`write`) are expensive due to context switches.
+### 3. Pipelining & Batching
+In the early versions (v1-v3), the bottleneck was the sheer number of system calls.
+
+**Without Pipelining:**
+- 1 Request = 2 Syscalls (Write + Read)
+- At 1M RPS = 2M syscalls/second
+
+**With Pipelining:**
+- 32 Requests = 2 Syscalls
+- At 1M RPS = ~62K syscalls/second
+
+By batching commands, we saturated the CPU cache rather than the Kernel's interrupt handler.
 
 **Optimization:**
 1. **Batch reads:** Read as much data as possible into a buffer in one syscall
@@ -133,26 +171,75 @@ Custom protocol avoids the overhead of text parsing (like Redis RESP):
 
 ---
 
-## 📈 Benchmark Insights
+## 🔬 Optimization Journey: From 306K to 1.65M RPS
 
-### Why Does Latency Spike at 100 Clients?
-This is the **saturation point** where:
-1. CPU core is fully utilized processing requests (single-threaded bottleneck)
-2. New requests start queuing in the kernel's socket buffers
-3. The system transitions from **latency-bound** to **throughput-bound** operation
+This server wasn't built in one shot—it's the result of systematic, iterative optimization. Through 11 distinct versions, each addressing specific bottlenecks, performance improved from 306K to 1.65M RPS.
 
-This is **normal behavior** for any high-performance server and demonstrates proper backpressure handling.
+**Total improvement: 5.4x from v1 to v11** 🚀
 
-### Why Does Throughput Plateau at 1.65M RPS?
-Likely bottlenecks (in order of impact):
-- **Single-threaded:** Only one CPU core utilized (visible in `htop` as one core at 100%)
-- **Syscall overhead:** Even with batching, `read`/`write` consume ~15-20% CPU time
-- **CPU instruction throughput:** Protocol parsing and hashtable operations saturate core
+### Key Learnings
 
-**Potential optimizations:**
-- Use `io_uring` (Linux 5.1+) to eliminate syscall overhead → **+30-50% RPS**
-- Multi-threaded architecture with lock-free hashtable (e.g., Folly ConcurrentHashMap) → **+4-8x RPS**
-- SIMD-accelerated hash functions (xxHash) for faster hashing → **+5-10% RPS**
+Each stage taught something valuable about systems programming:
+
+#### 1. **Syscalls Are Expensive** (v1 → v3: +49%)
+- Blocking on individual requests kills throughput
+- Batching (pipelining) reduced syscalls by 80%
+- **Lesson**: Minimize kernel crossings at all costs
+
+#### 2. **Generic Containers Have Overhead** (v4 → v7: +163%)
+- `std::unordered_map` has hidden allocations
+- Custom intrusive structures eliminate malloc from the hot path
+- **Lesson**: When performance matters, build your own data structures
+
+#### 3. **Predictability > Raw Speed** (v8: -17% RPS, but stable)
+- Unlimited pipelining hit 1.79M RPS but had 100ms+ tail latency
+- Limiting to 32 requests dropped to 1.48M but kept P99 under 10ms
+- **Lesson**: Production systems need predictable latency, not just max throughput
+
+#### 4. **Platform Matters** (v11: WSL2 vs Linux)
+- WSL2's optimized localhost gave 29% higher throughput
+- Native Linux more representative of production networks
+- **Lesson**: Always benchmark on target platform
+
+---
+
+### The 80/20 Rule in Action
+
+| Effort | RPS Gain | Cumulative |
+|:-------|:---------|:-----------|
+| **First 20% effort** (pipelining + epoll) | +127% | **680K RPS** |
+| **Next 60% effort** (hashtable + advanced tuning) | +163% | **1.79M RPS** |
+| **Last 20% effort** (memory opts + tuning) | -8% | **1.65M RPS** (but stable) |
+
+The biggest gains came from architectural changes (pipelining, epoll). Micro-optimizations helped, but with diminishing returns.
+
+---
+
+### What Didn't Work
+
+Not every optimization succeeded. Here's what we tried and abandoned:
+
+❌ **Unlimited pipeline depth** → Caused latency spikes  
+❌ **Connection pooling beyond 10K objects** → Memory overhead outweighed gains  
+
+**Lesson**: Measure everything. Intuition is often wrong.
+
+---
+
+## 📈 Architecture Limits
+
+Both platforms reached the **single-threaded ceiling**. The bottleneck is CPU instruction throughput on one core, not I/O or syscalls.
+
+**To exceed 1.65M RPS, architectural changes are required:**
+
+| Optimization | Expected Gain | Complexity |
+|:-------------|:--------------|:-----------|
+| **io_uring** (Linux 5.1+) | +30-50% | Medium |
+| **Multi-threaded I/O** (Redis 6.0 style) | +200-400% | High |
+| **Lock-free hashtable** + thread-per-core | +400-800% | Very High |
+| **SIMD hash functions** (xxHash) | +5-10% | Low |
+
+These would be production-grade improvements requiring 3-7 days implementation each.
 
 ---
 
@@ -173,16 +260,12 @@ Likely bottlenecks (in order of impact):
 
 ## 🎓 Learning Resources
 
-This project demonstrates concepts from:
-- **"The C10K Problem"** by Dan Kegel (event-driven I/O)
-- **Redis internals** (pipelining, protocol design)
-- **Linux network programming** (`epoll`, non-blocking sockets)
-- **Data structure optimization** (intrusive containers, cache locality)
-
 Recommended reading:
 - *[Beej's Guide to Network Programming](https://beej.us/guide/bgnet/)*
 - *[Build Your Own Redis](https://build-your-own.org/redis/)* (the guide I followed)
 - *Redis source code* (`networking.c`, `dict.c`)
+
+**Unexpected Finding:** This project revealed that WSL2's localhost is significantly faster than native Linux's loopback interface for TCP benchmarks—a valuable lesson about the importance of testing on target platforms.
 
 ---
 
